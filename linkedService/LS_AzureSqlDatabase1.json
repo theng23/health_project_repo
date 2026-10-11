@@ -9,7 +9,7 @@
 			"encrypt": "mandatory",
 			"trustServerCertificate": false,
 			"authenticationType": "SQL",
-			"userName": "key-thenghealth",
+			"userName": "theng-health-project",
 			"password": {
 				"type": "AzureKeyVaultSecret",
 				"store": {
