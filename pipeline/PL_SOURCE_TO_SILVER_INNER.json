@@ -76,7 +76,7 @@
 					"source": {
 						"type": "PostgreSqlV2Source",
 						"query": {
-							"value": "SELECT * FROM PUBLIC.hospitals",
+							"value": "SELECT * FROM PUBLIC.@{activity('Read Table Details').output.firstRow.source_table_name}",
 							"type": "Expression"
 						},
 						"queryTimeout": "02:00:00"
