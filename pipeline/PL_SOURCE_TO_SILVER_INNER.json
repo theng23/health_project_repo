@@ -74,13 +74,12 @@
 				"userProperties": [],
 				"typeProperties": {
 					"source": {
-						"type": "AzureSqlSource",
-						"sqlReaderQuery": {
-							"value": "select * from PUBLIC.@{activity('Read Table Details').output.firstRow.source_table_name}",
+						"type": "PostgreSqlV2Source",
+						"query": {
+							"value": "SELECT * FROM PUBLIC.hospitals",
 							"type": "Expression"
 						},
-						"queryTimeout": "02:00:00",
-						"partitionOption": "None"
+						"queryTimeout": "02:00:00"
 					},
 					"sink": {
 						"type": "ParquetSink",
@@ -103,7 +102,7 @@
 				},
 				"inputs": [
 					{
-						"referenceName": "AzureSqlTable1",
+						"referenceName": "DS_PostgreSqlTable1",
 						"type": "DatasetReference"
 					}
 				],
