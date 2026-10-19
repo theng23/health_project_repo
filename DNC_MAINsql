@@ -1,0 +1,237 @@
+WITH dnc_ranked AS (
+    SELECT
+        sas.response_result_2,
+        sas.time_of_call_start,
+        sas.time_of_call_end,
+        sas.username,
+        sas.team,
+        sas.cuid,
+        sas.media_server_ixn_guid,
+        sas.durations,
+        sas.call_type,
+        sas.custom_data_11,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY sas.cuid
+            ORDER BY
+                sas.time_of_call_start DESC,
+                sas.time_of_call_end DESC NULLS LAST,
+                sas.media_server_ixn_guid DESC
+        ) AS rn_dnc
+
+    FROM ap_tls.tb_tls_call_sas sas
+
+    WHERE sas.time_of_call_start >= ADD_MONTHS(SYSDATE, -3)
+      AND sas.time_of_call_start <= SYSDATE
+      AND sas.response_result_2 = 'Do Not Call'
+
+      -- Exclude specified teams; retain NULL teams
+      AND (
+            sas.team IS NULL
+            OR sas.team NOT IN (
+                'External Service',
+                'Telesales Call Center Leader'
+            )
+          )
+),
+
+/* ============================================================
+   1. Latest DNC per CUID
+   ============================================================ */
+dnc_latest AS (
+    SELECT
+        response_result_2,
+        time_of_call_start,
+        time_of_call_end,
+        username,
+        team,
+        cuid,
+        media_server_ixn_guid,
+        durations,
+        call_type,
+        custom_data_11
+    FROM dnc_ranked
+    WHERE rn_dnc = 1
+),
+
+/* ============================================================
+   2. Applications - CLX + CCX
+   ============================================================ */
+appl AS (
+
+    SELECT
+        cuid,
+        contract_code,
+        preprocess_date,
+        preprocess_user,
+        name_credit_status,
+        product_gr,
+        salesroom_code,
+        'CLX' AS appl_source
+    FROM ap_tls.tb_tls_appl_clx
+    WHERE preprocess_date >= ADD_MONTHS(SYSDATE, -3)
+      AND preprocess_date <= SYSDATE
+      -- AND salesroom_code = '010168'
+
+    UNION ALL
+
+    SELECT
+        cuid,
+        contract_code,
+        preprocess_date,
+        preprocess_user,
+        name_credit_status,
+        product_gr,
+        salesroom_code,
+        'CCX' AS appl_source
+    FROM ap_tls.tb_tls_appl_ccx
+    WHERE preprocess_date >= ADD_MONTHS(SYSDATE, -3)
+      AND preprocess_date <= SYSDATE
+      -- AND salesroom_code = '010168'
+),
+
+/* ============================================================
+   3. Offer
+   ============================================================ */
+offer_filtered AS (
+    SELECT
+        ca_id,
+        id_cuid,
+        ca_type,
+        ca_creation_dtm,
+        ca_deactivate_dtm
+    FROM ap_tls.tb_tls_offer
+    WHERE ca_creation_dtm <= SYSDATE
+      AND ca_deactivate_dtm >= ADD_MONTHS(SYSDATE, -3)
+),
+
+/* ============================================================
+   4. Join DNC with Application
+       DNC -> Application
+       Application -> DNC
+       DNC Only
+   ============================================================ */
+dnc_appl AS (
+    SELECT
+        dnc.response_result_2,
+        dnc.time_of_call_start,
+        dnc.time_of_call_end,
+        dnc.username,
+        dnc.team,
+        dnc.cuid,
+        dnc.media_server_ixn_guid,
+        dnc.durations,
+        dnc.call_type,
+        dnc.custom_data_11,
+
+        appl.appl_source,
+        appl.contract_code,
+        appl.preprocess_date,
+        appl.preprocess_user,
+        appl.name_credit_status,
+        appl.product_gr,
+        appl.salesroom_code,
+
+        /* Application exists after DNC */
+        CASE
+            WHEN appl.preprocess_date > dnc.time_of_call_start
+                THEN 'YES'
+            ELSE 'NO'
+        END AS has_appl_after_dnc,
+
+        /* Application exists before DNC */
+        CASE
+            WHEN appl.preprocess_date < dnc.time_of_call_start
+                THEN 'YES'
+            ELSE 'NO'
+        END AS has_appl_before_dnc,
+
+        /* Detail-level classification */
+        CASE
+            WHEN appl.contract_code IS NULL
+                THEN 'DNC_ONLY'
+
+            WHEN appl.preprocess_date > dnc.time_of_call_start
+                THEN 'DNC_THEN_APPLICATION'
+
+            WHEN appl.preprocess_date < dnc.time_of_call_start
+                THEN 'APPLICATION_THEN_DNC'
+
+            WHEN appl.preprocess_date = dnc.time_of_call_start
+                THEN 'SAME_TIME'
+
+            ELSE 'DNC_ONLY'
+        END AS dnc_status
+
+    FROM dnc_latest dnc
+
+    LEFT JOIN appl
+        ON dnc.cuid = appl.cuid
+       AND dnc.username = appl.preprocess_user
+)
+
+SELECT
+    /* ========================================================
+       DNC
+       ======================================================== */
+    da.response_result_2,
+    da.time_of_call_start,
+    da.time_of_call_end,
+    da.username,
+    da.team,
+    da.cuid,
+    da.media_server_ixn_guid,
+    da.durations,
+    da.call_type,
+    da.custom_data_11,
+
+    /* ========================================================
+       Status
+       ======================================================== */
+    da.has_appl_after_dnc,
+    da.has_appl_before_dnc,
+    da.dnc_status,
+
+    /* ========================================================
+       Application
+       ======================================================== */
+    da.appl_source,
+    da.contract_code,
+    da.preprocess_date,
+    da.preprocess_user,
+    da.name_credit_status,
+    da.product_gr,
+    da.salesroom_code,
+
+    /* ========================================================
+       HR hierarchy
+       ======================================================== */
+    hr.tl_username,
+    hr.sup_username,
+
+    /* ========================================================
+       Offer
+       ======================================================== */
+    offer.ca_id,
+    offer.ca_type,
+    offer.ca_creation_dtm,
+    offer.ca_deactivate_dtm
+
+FROM dnc_appl da
+
+LEFT JOIN offer_filtered offer
+    ON da.cuid = offer.id_cuid
+
+   -- AND da.product_gr = offer.ca_type
+
+   AND da.preprocess_date > offer.ca_creation_dtm
+   AND da.preprocess_date < offer.ca_deactivate_dtm
+
+LEFT JOIN ap_tls.hr_tls hr
+    ON da.username = hr.op_username
+
+   AND TO_CHAR(da.time_of_call_start,'YYYY-MM') = hr.month
+
+ORDER BY
+    da.time_of_call_start DESC,
+    da.preprocess_date;

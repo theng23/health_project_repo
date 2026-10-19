@@ -1,0 +1,2180 @@
+WITH call_base AS (
+    SELECT
+        sas.cuid,
+        sas.username,
+        sas.team,
+        sas.media_server_ixn_guid AS call_uuid,
+        sas.time_of_call_start,
+        sas.record_type,
+
+        CASE
+            WHEN UPPER(TRIM(sas.custom_data_11)) = 'AGENTX'
+            THEN 'Manual Outbound'
+
+            WHEN sas.type_tls_call = 'OB_Man'
+             AND sas.target_object_selected NOT LIKE '%INBOUND%'
+             AND sas.interaction_type_key = 3
+            THEN 'Manual Outbound'
+
+            WHEN sas.record_type = 'Personal Callback'
+            THEN 'Personal Callback'
+
+            ELSE sas.call_type
+        END AS call_type_std
+
+    FROM ap_tls.tb_tls_call_sas sas
+
+    WHERE (
+        sas.team IS NULL
+        OR sas.team NOT IN (
+            'External Service',
+            'Telesales Call Center Leader'
+        )
+    )
+
+    AND sas.cuid IN (
+--        '137401079',
+--        '131383932',
+--        '146937584',
+--        '6706589',
+--        '2302297'
+        '45787154',
+        '9634143',
+        '54880099',
+        '21031416',
+        '8210099',
+        '6706589',
+        '134736339',
+        '131383932',
+        '1843510'
+    )
+),
+
+t_ranked AS (
+    SELECT
+        c.cuid,
+        c.username,
+        c.team,
+
+        c.call_uuid AS call_uuid_t,
+        c.time_of_call_start AS time_of_call_start_t,
+        c.call_type_std AS call_type_t,
+        c.record_type AS record_type_t,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY c.cuid, c.username
+            ORDER BY
+                c.time_of_call_start DESC,
+                c.call_uuid DESC NULLS LAST
+        ) AS rn
+
+    FROM call_base c
+
+    WHERE c.time_of_call_start >= SYSDATE - 14
+      AND c.time_of_call_start < SYSDATE
+
+      AND c.call_type_std IN (
+          'Personal Callback',
+          'Manual Outbound'
+      )
+),
+
+t AS (
+    SELECT
+        cuid,
+        username,
+        team,
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t
+    FROM t_ranked
+    WHERE rn = 1
+),
+
+t0_ranked AS (
+    SELECT
+        t.cuid,
+        t.username,
+        t.team,
+
+        t.call_uuid_t,
+        t.time_of_call_start_t,
+        t.call_type_t,
+        t.record_type_t,
+
+        x.call_uuid AS call_uuid_t0,
+        x.time_of_call_start AS time_of_call_start_t0,
+        x.call_type_std AS call_type_t0,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY t.cuid, t.username
+            ORDER BY
+                x.time_of_call_start ASC NULLS LAST,
+                x.call_uuid ASC NULLS LAST
+        ) AS rn_t0
+
+    FROM t
+
+    LEFT JOIN call_base x
+        ON x.cuid = t.cuid
+       AND x.username = t.username
+       AND x.time_of_call_start < t.time_of_call_start_t
+       AND x.time_of_call_start >= ADD_MONTHS(t.time_of_call_start_t,-1)
+       AND x.call_type_std IN ('Inbound','Outbound')
+),
+
+calls AS (
+    SELECT
+        cuid,
+        username,
+        team,
+
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t,
+
+        call_uuid_t0,
+        time_of_call_start_t0,
+        call_type_t0,
+
+        time_of_call_start_t
+            - time_of_call_start_t0 AS diff_t_t0,
+
+        CASE
+            WHEN time_of_call_start_t0 IS NULL
+            THEN 1
+
+            WHEN time_of_call_start_t
+                 - time_of_call_start_t0 <= 14
+            THEN 1
+
+            ELSE 0
+        END AS result_step_1
+
+    FROM t0_ranked
+
+    WHERE rn_t0 = 1
+),
+
+contract_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+
+        a.contract_code,
+        'CLX' AS appl_source,
+
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN ap_tls.tb_tls_appl_clx a
+      ON a.cuid = s.cuid
+     AND (
+            a.preprocess_user = s.username
+         OR a.process_user = s.username
+     )
+
+    WHERE a.contract_code IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+
+        a.contract_code,
+        'CCX' AS appl_source,
+
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN ap_tls.tb_tls_appl_ccx a
+      ON a.cuid = s.cuid
+     AND (
+            a.preprocess_user = s.username
+         OR a.process_user = s.username
+     )
+
+    WHERE a.contract_code IS NOT NULL
+),
+
+bod AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.team,
+        s.call_uuid_t,
+        s.time_of_call_start_t,
+        s.call_type_t,
+        s.record_type_t,
+        s.call_uuid_t0,
+        s.time_of_call_start_t0,
+        s.result_step_1,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date AS bod1_date,
+        a.process_date AS bod2_date,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date >= s.time_of_call_start_t - 30
+             AND a.preprocess_date < s.time_of_call_start_t
+            THEN 1
+            ELSE 0
+        END AS bod1_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date >= s.time_of_call_start_t - 180
+             AND a.process_date < s.time_of_call_start_t
+            THEN 1
+            ELSE 0
+        END AS bod2_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+            THEN 'BOD2'
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+            THEN 'BOD1'
+
+            ELSE NULL
+        END AS stage,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+            THEN a.process_date
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+            THEN a.preprocess_date
+
+            ELSE NULL
+        END AS bod_date
+
+    FROM calls s
+
+    LEFT JOIN contract_candidates a
+      ON a.cuid = s.cuid
+     AND a.username = s.username
+),
+
+step2 AS (
+    SELECT
+        b.*,
+
+        CASE
+            WHEN b.bod1_result = 1
+              OR b.bod2_result = 1
+            THEN 1
+            ELSE 0
+        END AS result_step_2
+
+    FROM bod b
+),
+
+next_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code AS current_contract_code,
+        s.bod1_date,
+
+        a.contract_code AS next_apply_contract_code,
+        a.preprocess_date AS next_apply_date,
+        a.name_credit_status AS name_credit_status,
+
+        'CLX' AS source_code
+
+    FROM step2 s
+
+    JOIN ap_tls.tb_tls_appl_clx a
+      ON a.cuid = s.cuid
+     AND a.preprocess_user = s.username
+     AND a.contract_code IS NOT NULL
+     AND a.contract_code <> s.contract_code
+     AND a.preprocess_date > s.bod1_date
+     AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code,
+        s.bod1_date,
+
+        a.contract_code,
+        a.preprocess_date,
+        a.name_credit_status,
+
+        'CCX' AS source_code
+
+    FROM step2 s
+
+    JOIN ap_tls.tb_tls_appl_ccx a
+      ON a.cuid = s.cuid
+     AND a.preprocess_user = s.username
+     AND a.contract_code IS NOT NULL
+     AND a.contract_code <> s.contract_code
+     AND a.preprocess_date > s.bod1_date
+     AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+),
+
+next_ranked AS (
+    SELECT
+        n.*,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                n.cuid,
+                n.username,
+                n.current_contract_code,
+                n.bod1_date
+            ORDER BY
+                n.next_apply_date,
+                n.next_apply_contract_code,
+                n.source_code
+        ) AS rn
+
+    FROM next_candidates n
+),
+
+step3 AS (
+    SELECT
+        s.*,
+
+        n.next_apply_contract_code,
+        n.next_apply_date,
+        n.name_credit_status,
+
+       CASE
+    WHEN s.contract_code IS NULL
+      OR s.bod1_date IS NULL
+      OR s.username IS NULL
+    THEN NULL
+
+    WHEN EXISTS (
+        SELECT 1
+        FROM ap_tls.tb_tls_appl_clx h
+        WHERE h.cuid = s.cuid
+
+          /* Ph?i là h?p ??ng khác */
+          AND h.contract_code <> s.contract_code
+
+          AND (
+                (
+                    h.preprocess_date >= s.bod1_date - 14
+                    AND h.preprocess_date < s.bod1_date
+                    AND (
+                        h.preprocess_user <> s.username
+                        OR h.preprocess_user IS NULL
+                    )
+                )
+
+                OR
+
+                (
+                    h.process_date >= s.bod1_date - 14
+                    AND h.process_date < s.bod1_date
+                    AND (
+                        h.process_user <> s.username
+                        OR h.process_user IS NULL
+                    )
+                )
+          )
+    )
+
+    OR EXISTS (
+        SELECT 1
+        FROM ap_tls.tb_tls_appl_ccx h
+        WHERE h.cuid = s.cuid
+
+          /* Ph?i là h?p ??ng khác */
+          AND h.contract_code <> s.contract_code
+
+          AND (
+                (
+                    h.preprocess_date >= s.bod1_date - 14
+                    AND h.preprocess_date < s.bod1_date
+                    AND (
+                        h.preprocess_user <> s.username
+                        OR h.preprocess_user IS NULL
+                    )
+                )
+
+                OR
+
+                (
+                    h.process_date >= s.bod1_date - 14
+                    AND h.process_date < s.bod1_date
+                    AND (
+                        h.process_user <> s.username
+                        OR h.process_user IS NULL
+                    )
+                )
+          )
+    )
+
+    THEN 0
+    ELSE 1
+END AS last_apply_14_days
+
+    FROM step2 s
+
+    LEFT JOIN next_ranked n
+      ON n.cuid = s.cuid
+     AND n.username = s.username
+     AND n.current_contract_code = s.contract_code
+     AND n.bod1_date = s.bod1_date
+     AND n.rn = 1
+)
+
+SELECT
+    /*+ PARALLEL(16) */
+
+    r.cuid,
+    r.username,
+    r.team,
+    hr.sup_name,
+
+    r.call_uuid_t,
+    r.call_type_t,
+--    r.record_type_t,
+
+    r.time_of_call_start_t0,
+    r.time_of_call_start_t,
+
+    r.contract_code,
+    r.appl_source,
+
+    r.stage,
+    r.bod_date,
+
+    r.time_of_call_start_t
+        - r.bod_date AS follow_dates,
+
+    r.bod1_date,
+    r.bod2_date,
+
+    r.result_step_1,
+
+    r.bod1_result,
+    r.bod2_result,
+    r.result_step_2,
+
+    r.last_apply_14_days,
+
+    r.next_apply_contract_code,
+    r.next_apply_date,
+    r.name_credit_status,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+        THEN 1
+        ELSE 0
+    END AS result_step_3,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+         AND (
+                r.result_step_1 = 1
+             OR r.result_step_2 = 1
+         )
+        THEN 1
+        ELSE 0
+    END AS final_result
+
+FROM step3 r
+
+LEFT JOIN (
+    SELECT
+        t.username AS op_username,
+        TO_CHAR(
+            t.time_of_call_start_t,
+            'YYYY-MM'
+        ) AS month,
+
+        MAX(h.sup_name) AS sup_name
+
+    FROM t
+
+    JOIN ap_tls.hr_tls h
+      ON h.op_username = t.username
+     AND h.month = TO_CHAR(
+         t.time_of_call_start_t,
+         'YYYY-MM'
+     )
+
+    WHERE h.sup_name IS NOT NULL
+
+    GROUP BY
+        t.username,
+        TO_CHAR(
+            t.time_of_call_start_t,
+            'YYYY-MM'
+        )
+
+    HAVING COUNT(DISTINCT h.sup_name) = 1
+
+) hr
+  ON hr.op_username = r.username
+ AND hr.month = TO_CHAR(
+     r.time_of_call_start_t,
+     'YYYY-MM'
+ )
+
+ORDER BY
+    r.cuid,
+    r.time_of_call_start_t;
+    
+    
+    
+    
+    
+    
+    
+    
+--------------------------------------------------------------------------------
+---------------------------------1/10/2026--------------------------------------
+WITH call_base AS (
+    SELECT
+        sas.cuid,
+        sas.username,
+        sas.team,
+        sas.media_server_ixn_guid AS call_uuid,
+        sas.time_of_call_start,
+        sas.record_type,
+        CASE
+            WHEN UPPER(TRIM(sas.custom_data_11)) = 'AGENTX'
+                THEN 'Manual Outbound'
+            WHEN sas.type_tls_call = 'OB_Man'
+             AND sas.target_object_selected NOT LIKE '%INBOUND%'
+             AND sas.interaction_type_key = 3
+                THEN 'Manual Outbound'
+            WHEN sas.record_type = 'Personal Callback'
+                THEN 'Personal Callback'
+            ELSE sas.call_type
+        END AS call_type_std
+    FROM ap_tls.tb_tls_call_sas sas
+    WHERE (sas.team IS NULL
+           OR sas.team NOT IN (
+               'External Service',
+               'Telesales Call Center Leader'
+           ))
+      AND sas.cuid IN (
+          '45787154',
+          '9634143',
+          '54880099',
+          '21031416',
+          '8210099',
+          '6706589',
+          '134736339',
+          '131383932',
+          '1843510'
+      )
+),
+
+t_ranked AS (
+    SELECT
+        c.cuid,
+        c.username,
+        c.team,
+        c.call_uuid AS call_uuid_t,
+        c.time_of_call_start AS time_of_call_start_t,
+        c.call_type_std AS call_type_t,
+        c.record_type AS record_type_t,
+        ROW_NUMBER() OVER (
+            PARTITION BY c.cuid, c.username
+            ORDER BY c.time_of_call_start DESC,
+                     c.call_uuid DESC NULLS LAST
+        ) AS rn
+    FROM call_base c
+    WHERE c.time_of_call_start >= SYSDATE - 14
+      AND c.time_of_call_start < SYSDATE
+      AND c.call_type_std IN (
+          'Personal Callback',
+          'Manual Outbound'
+      )
+),
+
+t AS (
+    SELECT
+        cuid,
+        username,
+        team,
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t
+    FROM t_ranked
+    WHERE rn = 1
+),
+
+t0_ranked AS (
+    SELECT
+        t.cuid,
+        t.username,
+        t.team,
+        t.call_uuid_t,
+        t.time_of_call_start_t,
+        t.call_type_t,
+        t.record_type_t,
+        x.call_uuid AS call_uuid_t0,
+        x.time_of_call_start AS time_of_call_start_t0,
+        x.call_type_std AS call_type_t0,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY t.cuid, t.username
+            ORDER BY x.time_of_call_start ASC NULLS LAST,
+                     x.call_uuid ASC NULLS LAST
+        ) AS rn_t0
+
+    FROM t
+
+    LEFT JOIN call_base x
+      ON x.cuid = t.cuid
+     AND x.username = t.username
+     AND x.time_of_call_start < t.time_of_call_start_t
+     AND x.time_of_call_start >= ADD_MONTHS(t.time_of_call_start_t, -1)
+     AND x.call_type_std IN ('Inbound', 'Outbound')
+),
+
+calls AS (
+    SELECT
+        cuid,
+        username,
+        team,
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t,
+        call_uuid_t0,
+        time_of_call_start_t0,
+        call_type_t0,
+
+        time_of_call_start_t - time_of_call_start_t0 AS diff_t_t0,
+
+        CASE
+            WHEN time_of_call_start_t0 IS NULL THEN 1
+            WHEN time_of_call_start_t - time_of_call_start_t0 <= 14 THEN 1
+            ELSE 0
+        END AS result_step_1
+
+    FROM t0_ranked
+    WHERE rn_t0 = 1
+),
+
+contract_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+        a.contract_code,
+        'CLX' AS appl_source,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN ap_tls.tb_tls_appl_clx a
+      ON a.cuid = s.cuid
+     AND (
+            a.preprocess_user = s.username
+         OR a.process_user = s.username
+     )
+
+    WHERE a.contract_code IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+        a.contract_code,
+        'CCX' AS appl_source,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN ap_tls.tb_tls_appl_ccx a
+      ON a.cuid = s.cuid
+     AND (
+            a.preprocess_user = s.username
+         OR a.process_user = s.username
+     )
+
+    WHERE a.contract_code IS NOT NULL
+),
+
+bod AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.team,
+        s.call_uuid_t,
+        s.time_of_call_start_t,
+        s.call_type_t,
+        s.record_type_t,
+        s.call_uuid_t0,
+        s.time_of_call_start_t0,
+        s.result_step_1,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date AS bod1_date,
+        a.process_date AS bod2_date,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+            THEN a.preprocess_user
+        END AS bod1_username,
+
+        CASE
+            WHEN a.process_user = s.username
+            THEN a.process_user
+        END AS bod2_username,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date >= s.time_of_call_start_t - 30
+             AND a.preprocess_date < s.time_of_call_start_t
+            THEN 1
+            ELSE 0
+        END AS bod1_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date >= s.time_of_call_start_t - 180
+             AND a.process_date < s.time_of_call_start_t
+            THEN 1
+            ELSE 0
+        END AS bod2_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+            THEN 'BOD2'
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+            THEN 'BOD1'
+        END AS stage,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+            THEN a.process_date
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+            THEN a.preprocess_date
+        END AS bod_date
+
+    FROM calls s
+
+    LEFT JOIN contract_candidates a
+      ON a.cuid = s.cuid
+     AND a.username = s.username
+),
+
+step2 AS (
+    SELECT
+        b.*,
+        CASE
+            WHEN b.bod1_result = 1
+              OR b.bod2_result = 1
+            THEN 1
+            ELSE 0
+        END AS result_step_2
+    FROM bod b
+),
+
+next_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code AS current_contract_code,
+        s.bod1_date,
+        a.contract_code AS next_apply_contract_code,
+        a.preprocess_date AS next_apply_date,
+        a.name_credit_status,
+        'CLX' AS source_code
+
+    FROM step2 s
+
+    JOIN ap_tls.tb_tls_appl_clx a
+      ON a.cuid = s.cuid
+     AND a.preprocess_user = s.username
+     AND a.contract_code IS NOT NULL
+     AND a.contract_code <> s.contract_code
+     AND a.preprocess_date > s.bod1_date
+     AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code,
+        s.bod1_date,
+        a.contract_code,
+        a.preprocess_date,
+        a.name_credit_status,
+        'CCX' AS source_code
+
+    FROM step2 s
+
+    JOIN ap_tls.tb_tls_appl_ccx a
+      ON a.cuid = s.cuid
+     AND a.preprocess_user = s.username
+     AND a.contract_code IS NOT NULL
+     AND a.contract_code <> s.contract_code
+     AND a.preprocess_date > s.bod1_date
+     AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+),
+
+next_ranked AS (
+    SELECT
+        n.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                n.cuid,
+                n.username,
+                n.current_contract_code,
+                n.bod1_date
+            ORDER BY
+                n.next_apply_date,
+                n.next_apply_contract_code,
+                n.source_code
+        ) AS rn
+    FROM next_candidates n
+),
+
+step3 AS (
+    SELECT
+        s.*,
+        n.next_apply_contract_code,
+        n.next_apply_date,
+        n.name_credit_status,
+
+        CASE
+            WHEN s.contract_code IS NULL
+              OR s.bod1_date IS NULL
+              OR s.bod1_username IS NULL
+              OR s.username IS NULL
+            THEN 0
+
+            WHEN s.bod1_username <> s.username
+            THEN 0
+
+            WHEN EXISTS (
+                SELECT 1
+                FROM ap_tls.tb_tls_appl_clx h
+                WHERE h.cuid = s.cuid
+                  AND h.contract_code IS NOT NULL
+                  AND h.contract_code <> s.contract_code
+                  AND (
+                        (
+                            h.preprocess_date >= s.bod1_date - 14
+                            AND h.preprocess_date < s.bod1_date
+                            AND (
+                                h.preprocess_user <> s.username
+                                OR h.preprocess_user IS NULL
+                            )
+                        )
+                        OR
+                        (
+                            h.process_date >= s.bod1_date - 14
+                            AND h.process_date < s.bod1_date
+                            AND (
+                                h.process_user <> s.username
+                                OR h.process_user IS NULL
+                            )
+                        )
+                  )
+            )
+
+            OR EXISTS (
+                SELECT 1
+                FROM ap_tls.tb_tls_appl_ccx h
+                WHERE h.cuid = s.cuid
+                  AND h.contract_code IS NOT NULL
+                  AND h.contract_code <> s.contract_code
+                  AND (
+                        (
+                            h.preprocess_date >= s.bod1_date - 14
+                            AND h.preprocess_date < s.bod1_date
+                            AND (
+                                h.preprocess_user <> s.username
+                                OR h.preprocess_user IS NULL
+                            )
+                        )
+                        OR
+                        (
+                            h.process_date >= s.bod1_date - 14
+                            AND h.process_date < s.bod1_date
+                            AND (
+                                h.process_user <> s.username
+                                OR h.process_user IS NULL
+                            )
+                        )
+                  )
+            )
+
+            THEN 0
+            ELSE 1
+        END AS last_apply_14_days
+
+    FROM step2 s
+
+    LEFT JOIN next_ranked n
+      ON n.cuid = s.cuid
+     AND n.username = s.username
+     AND n.current_contract_code = s.contract_code
+     AND n.bod1_date = s.bod1_date
+     AND n.rn = 1
+)
+
+SELECT
+    /*+ PARALLEL(16) */
+
+    r.cuid,
+    r.username,
+    r.team,
+    hr.sup_name,
+
+    r.call_uuid_t,
+    r.call_type_t,
+
+    r.time_of_call_start_t0,
+    r.time_of_call_start_t,
+
+    r.contract_code,
+    r.appl_source,
+
+    r.stage,
+    r.bod_date,
+    r.time_of_call_start_t - r.bod_date AS follow_dates,
+
+    r.bod1_date,
+    r.bod1_username,
+
+    r.bod2_date,
+    r.bod2_username,
+
+    r.result_step_1,
+
+    r.bod1_result,
+    r.bod2_result,
+    r.result_step_2,
+
+    r.last_apply_14_days,
+
+    r.next_apply_contract_code,
+    r.next_apply_date,
+    r.name_credit_status,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+        THEN 1
+        ELSE 0
+    END AS result_step_3,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+         AND (
+                r.result_step_1 = 1
+             OR r.result_step_2 = 1
+         )
+        THEN 1
+        ELSE 0
+    END AS final_result
+
+FROM step3 r
+
+LEFT JOIN (
+    SELECT
+        t.username AS op_username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM') AS month,
+        MAX(h.sup_name) AS sup_name
+
+    FROM t
+
+    JOIN ap_tls.hr_tls h
+      ON h.op_username = t.username
+     AND h.month = TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    WHERE h.sup_name IS NOT NULL
+
+    GROUP BY
+        t.username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    HAVING COUNT(DISTINCT h.sup_name) = 1
+) hr
+  ON hr.op_username = r.username
+ AND hr.month = TO_CHAR(r.time_of_call_start_t, 'YYYY-MM')
+
+ORDER BY
+    r.cuid,
+    r.time_of_call_start_t;
+    
+------------------------------------------------
+
+
+
+
+
+WITH call_base AS (
+    SELECT
+        sas.cuid,
+        sas.username,
+        sas.team,
+        sas.media_server_ixn_guid AS call_uuid,
+        sas.time_of_call_start,
+        sas.record_type,
+
+        CASE
+            WHEN UPPER(TRIM(sas.custom_data_11)) = 'AGENTX'
+                THEN 'Manual Outbound'
+
+            WHEN sas.type_tls_call = 'OB_Man'
+             AND sas.target_object_selected NOT LIKE '%INBOUND%'
+             AND sas.interaction_type_key = 3
+                THEN 'Manual Outbound'
+
+            WHEN sas.record_type = 'Personal Callback'
+                THEN 'Personal Callback'
+
+            ELSE sas.call_type
+        END AS call_type_std
+
+    FROM ap_tls.tb_tls_call_sas sas
+
+    WHERE sas.time_of_call_start >= ADD_MONTHS(SYSDATE, -2)
+      AND sas.time_of_call_start < SYSDATE
+
+      AND (
+            sas.team IS NULL
+            OR sas.team NOT IN (
+                'External Service',
+                'Telesales Call Center Leader'
+            )
+          )
+
+    AND sas.cuid IN (
+--        '45787154',
+--        '9634143',
+--        '54880099',
+--        '21031416',
+--        '8210099',
+--        '6706589',
+--        '134736339',
+--        '131383932',
+        '3298579',
+        '14391876',
+        '38483852',
+        '7269653',
+        '7269653',
+        '7269653',
+        '7890165',
+        '52788718'
+    )
+),
+
+/* =========================================================
+   T - latest Personal Callback / Manual Outbound
+   1 month
+   ========================================================= */
+t_ranked AS (
+    SELECT
+        c.cuid,
+        c.username,
+        c.team,
+        c.call_uuid AS call_uuid_t,
+        c.time_of_call_start AS time_of_call_start_t,
+        c.call_type_std AS call_type_t,
+        c.record_type AS record_type_t,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY c.cuid, c.username
+            ORDER BY
+                c.time_of_call_start DESC,
+                c.call_uuid DESC NULLS LAST
+        ) AS rn
+
+    FROM call_base c
+
+    WHERE c.time_of_call_start >= ADD_MONTHS(SYSDATE, -1)
+      AND c.time_of_call_start < SYSDATE
+      AND c.call_type_std IN (
+          'Personal Callback',
+          'Manual Outbound'
+      )
+),
+
+t AS (
+    SELECT
+        cuid,
+        username,
+        team,
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t
+    FROM t_ranked
+    WHERE rn = 1
+),
+
+/* =========================================================
+   T0
+   Keep original logic:
+   up to 1 month before T
+   ========================================================= */
+t0_ranked AS (
+    SELECT
+        t.cuid,
+        t.username,
+        t.team,
+        t.call_uuid_t,
+        t.time_of_call_start_t,
+        t.call_type_t,
+        t.record_type_t,
+
+        x.call_uuid AS call_uuid_t0,
+        x.time_of_call_start AS time_of_call_start_t0,
+        x.call_type_std AS call_type_t0,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY t.cuid, t.username
+            ORDER BY
+                x.time_of_call_start ASC NULLS LAST,
+                x.call_uuid ASC NULLS LAST
+        ) AS rn_t0
+
+    FROM t
+
+    LEFT JOIN call_base x
+        ON x.cuid = t.cuid
+       AND x.username = t.username
+       AND x.time_of_call_start < t.time_of_call_start_t
+       AND x.time_of_call_start >= ADD_MONTHS(t.time_of_call_start_t, -1)
+       AND x.call_type_std IN ('Inbound', 'Outbound')
+),
+
+calls AS (
+    SELECT
+        cuid,
+        username,
+        team,
+
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t,
+
+        call_uuid_t0,
+        time_of_call_start_t0,
+        call_type_t0,
+
+        time_of_call_start_t
+            - time_of_call_start_t0 AS diff_t_t0,
+
+        CASE
+            WHEN time_of_call_start_t0 IS NULL THEN 1
+            WHEN time_of_call_start_t
+                 - time_of_call_start_t0 <= 14 THEN 1
+            ELSE 0
+        END AS result_step_1
+
+    FROM t0_ranked
+    WHERE rn_t0 = 1
+),
+
+/* =========================================================
+   Only applications for required CUIDs
+   ========================================================= */
+target_cuids AS (
+    SELECT /*+ MATERIALIZE */
+        DISTINCT cuid
+    FROM calls
+),
+
+/* =========================================================
+   CLX + CCX
+   ========================================================= */
+appl_base AS (
+    SELECT /*+ MATERIALIZE */
+        a.cuid,
+        a.contract_code,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user,
+        a.name_credit_status,
+        'CLX' AS appl_source
+
+    FROM ap_tls.tb_tls_appl_clx a
+
+    JOIN target_cuids c
+        ON c.cuid = a.cuid
+
+    WHERE a.contract_code IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        a.cuid,
+        a.contract_code,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user,
+        a.name_credit_status,
+        'CCX' AS appl_source
+
+    FROM ap_tls.tb_tls_appl_ccx a
+
+    JOIN target_cuids c
+        ON c.cuid = a.cuid
+
+    WHERE a.contract_code IS NOT NULL
+),
+
+/* =========================================================
+   Application relate Ops
+   ========================================================= */
+contract_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN appl_base a
+        ON a.cuid = s.cuid
+       AND (
+            a.preprocess_user = s.username
+            OR a.process_user = s.username
+       )
+),
+
+/* =========================================================
+   STEP 2 - BOD
+   ========================================================= */
+bod AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.team,
+
+        s.call_uuid_t,
+        s.time_of_call_start_t,
+        s.call_type_t,
+        s.record_type_t,
+
+        s.call_uuid_t0,
+        s.time_of_call_start_t0,
+
+        s.result_step_1,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date AS bod1_date,
+        a.process_date AS bod2_date,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+                THEN a.preprocess_user
+        END AS bod1_username,
+
+        CASE
+            WHEN a.process_user = s.username
+                THEN a.process_user
+        END AS bod2_username,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date >= s.time_of_call_start_t - 30
+             AND a.preprocess_date < s.time_of_call_start_t
+                THEN 1
+            ELSE 0
+        END AS bod1_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date >= s.time_of_call_start_t - 180
+             AND a.process_date < s.time_of_call_start_t
+                THEN 1
+            ELSE 0
+        END AS bod2_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+                THEN 'BOD2'
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+                THEN 'BOD1'
+        END AS stage,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+                THEN a.process_date
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+                THEN a.preprocess_date
+        END AS bod_date
+
+    FROM calls s
+
+    LEFT JOIN contract_candidates a
+        ON a.cuid = s.cuid
+       AND a.username = s.username
+),
+
+step2 AS (
+    SELECT
+        b.*,
+
+        CASE
+            WHEN b.bod1_result = 1
+              OR b.bod2_result = 1
+                THEN 1
+            ELSE 0
+        END AS result_step_2
+
+    FROM bod b
+),
+
+/* =========================================================
+   Next application
+   ========================================================= */
+next_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code AS current_contract_code,
+        s.bod1_date,
+
+        a.contract_code AS next_apply_contract_code,
+        a.preprocess_date AS next_apply_date,
+        a.name_credit_status,
+        a.appl_source AS source_code
+
+    FROM step2 s
+
+    JOIN appl_base a
+        ON a.cuid = s.cuid
+       AND a.preprocess_user = s.username
+       AND a.contract_code <> s.contract_code
+       AND a.preprocess_date > s.bod1_date
+       AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+),
+
+next_ranked AS (
+    SELECT
+        n.*,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                n.cuid,
+                n.username,
+                n.current_contract_code,
+                n.bod1_date
+
+            ORDER BY
+                n.next_apply_date,
+                n.next_apply_contract_code,
+                n.source_code
+        ) AS rn
+
+    FROM next_candidates n
+),
+
+/* =========================================================
+   STEP 3
+   ========================================================= */
+step3 AS (
+    SELECT
+        s.*,
+
+        n.next_apply_contract_code,
+        n.next_apply_date,
+        n.name_credit_status,
+
+        CASE
+            WHEN s.contract_code IS NULL
+              OR s.bod1_date IS NULL
+              OR s.bod1_username IS NULL
+              OR s.username IS NULL
+                THEN 0
+
+            WHEN s.bod1_username <> s.username
+                THEN 0
+
+            WHEN EXISTS (
+                SELECT 1
+                FROM appl_base h
+
+                WHERE h.cuid = s.cuid
+                  AND h.contract_code <> s.contract_code
+
+                  AND (
+                        (
+                            h.preprocess_date >= s.bod1_date - 14
+                            AND h.preprocess_date < s.bod1_date
+                            AND (
+                                h.preprocess_user <> s.username
+                                OR h.preprocess_user IS NULL
+                            )
+                        )
+
+                        OR
+
+                        (
+                            h.process_date >= s.bod1_date - 14
+                            AND h.process_date < s.bod1_date
+                            AND (
+                                h.process_user <> s.username
+                                OR h.process_user IS NULL
+                            )
+                        )
+                  )
+            )
+                THEN 0
+
+            ELSE 1
+        END AS last_apply_14_days
+
+    FROM step2 s
+
+    LEFT JOIN next_ranked n
+        ON n.cuid = s.cuid
+       AND n.username = s.username
+       AND n.current_contract_code = s.contract_code
+       AND n.bod1_date = s.bod1_date
+       AND n.rn = 1
+),
+
+/* =========================================================
+   HR mapping
+   ========================================================= */
+hr AS (
+    SELECT
+        t.username AS op_username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM') AS month,
+        MAX(h.sup_name) AS sup_name
+
+    FROM t
+
+    JOIN ap_tls.hr_tls h
+        ON h.op_username = t.username
+       AND h.month =
+           TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    WHERE h.sup_name IS NOT NULL
+
+    GROUP BY
+        t.username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    HAVING COUNT(DISTINCT h.sup_name) = 1
+)
+
+/* =========================================================
+   FINAL
+   ========================================================= */
+SELECT /*+ PARALLEL(16) */
+    r.cuid,
+    r.username,
+    r.team,
+    hr.sup_name,
+
+    r.call_uuid_t,
+    r.call_type_t,
+
+    r.time_of_call_start_t0,
+    r.time_of_call_start_t,
+
+    r.contract_code,
+    r.appl_source,
+
+    r.stage,
+    r.bod_date,
+
+    r.time_of_call_start_t
+        - r.bod_date AS follow_dates,
+
+    r.bod1_date,
+    r.bod1_username,
+
+    r.bod2_date,
+    r.bod2_username,
+
+    r.result_step_1,
+
+    r.bod1_result,
+    r.bod2_result,
+    r.result_step_2,
+
+    r.last_apply_14_days,
+
+    r.next_apply_contract_code,
+    r.next_apply_date,
+    r.name_credit_status,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+            THEN 1
+        ELSE 0
+    END AS result_step_3,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+         AND (
+                r.result_step_1 = 1
+                OR r.result_step_2 = 1
+             )
+            THEN 1
+        ELSE 0
+    END AS final_result
+
+FROM step3 r
+
+LEFT JOIN hr
+    ON hr.op_username = r.username
+   AND hr.month =
+       TO_CHAR(r.time_of_call_start_t, 'YYYY-MM')
+
+order by r.cuid desc, r.time_of_call_start_t desc   
+       ;
+       
+       
+
+
+------------07/10/2026--------------
+
+
+WITH call_base AS (
+    SELECT
+        sas.cuid,
+        sas.username,
+        sas.team,
+        sas.media_server_ixn_guid AS call_uuid,
+        sas.time_of_call_start,
+        sas.record_type,
+
+        CASE
+            WHEN sas.custom_data_11 = 'Agentx'
+                THEN 'Manual Outbound'
+
+            WHEN sas.type_tls_call = 'OB_Man'
+             AND sas.target_object_selected NOT LIKE '%INBOUND%'
+             AND sas.interaction_type_key = 3
+                THEN 'Manual Outbound'
+
+            WHEN sas.record_type = 'Personal Callback'
+                THEN 'Personal Callback'
+
+            ELSE sas.call_type
+        END AS call_type_std
+
+    FROM ap_tls.tb_tls_call_sas sas
+
+    WHERE sas.time_of_call_start >= ADD_MONTHS(SYSDATE, -2)
+      AND sas.time_of_call_start < SYSDATE
+
+      AND (
+            sas.team IS NULL
+            OR sas.team NOT IN (
+                'External Service',
+                'Telesales Call Center Leader'
+            )
+          )
+
+    AND sas.cuid IN (
+--        '45787154',
+--        '9634143',
+--        '54880099',
+--        '21031416',
+--        '8210099',
+--        '6706589',
+--        '134736339',
+--        '131383932',
+        '3298579'
+--        '38483852'
+--        '14391876'
+    )
+--    AND sas.contract_code in (
+--    '4605445228',
+--    '4605458637',
+--    '4605458704',
+--    '4605581892',
+--    '4605587820',
+--    '4605547904',
+--    '4605596266',
+--    '4605599391'
+--    )
+),
+
+/* =========================================================
+   T - latest Personal Callback / Manual Outbound
+   1 month
+   ========================================================= */
+t_ranked AS (
+    SELECT
+        c.cuid,
+        c.username,
+        c.team,
+        c.call_uuid AS call_uuid_t,
+        c.time_of_call_start AS time_of_call_start_t,
+        c.call_type_std AS call_type_t,
+        c.record_type AS record_type_t,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY c.cuid, c.username
+            ORDER BY
+                c.time_of_call_start DESC,
+                c.call_uuid DESC NULLS LAST
+        ) AS rn
+
+    FROM call_base c
+
+    WHERE c.time_of_call_start >= ADD_MONTHS(SYSDATE, -1)
+      AND c.time_of_call_start < SYSDATE
+      AND c.call_type_std IN (
+          'Personal Callback',
+          'Manual Outbound'
+      )
+),
+
+t AS (
+    SELECT
+        cuid,
+        username,
+        team,
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t
+    FROM t_ranked
+    WHERE rn = 1
+),
+
+/* =========================================================
+   T0
+   Keep original logic:
+   up to 1 month before T
+   ========================================================= */
+t0_ranked AS (
+    SELECT
+        t.cuid,
+        t.username,
+        t.team,
+        t.call_uuid_t,
+        t.time_of_call_start_t,
+        t.call_type_t,
+        t.record_type_t,
+
+        x.call_uuid AS call_uuid_t0,
+        x.time_of_call_start AS time_of_call_start_t0,
+        x.call_type_std AS call_type_t0,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY t.cuid, t.username
+            ORDER BY
+                x.time_of_call_start ASC NULLS LAST,
+                x.call_uuid ASC NULLS LAST
+        ) AS rn_t0
+
+    FROM t
+
+    LEFT JOIN call_base x
+        ON x.cuid = t.cuid
+       AND x.username = t.username
+       AND x.time_of_call_start < t.time_of_call_start_t
+       AND x.time_of_call_start >= ADD_MONTHS(t.time_of_call_start_t, -1)
+       AND x.call_type_std IN ('Inbound', 'Outbound')
+),
+
+calls AS (
+    SELECT
+        cuid,
+        username,
+        team,
+
+        call_uuid_t,
+        time_of_call_start_t,
+        call_type_t,
+        record_type_t,
+
+        call_uuid_t0,
+        time_of_call_start_t0,
+        call_type_t0,
+
+        time_of_call_start_t
+            - time_of_call_start_t0 AS diff_t_t0,
+
+        CASE
+            WHEN time_of_call_start_t0 IS NULL THEN 1
+            WHEN time_of_call_start_t
+                 - time_of_call_start_t0 <= 14 THEN 1
+            ELSE 0
+        END AS result_step_1
+
+    FROM t0_ranked
+    WHERE rn_t0 = 1
+),
+
+/* =========================================================
+   Only applications for required CUIDs
+   ========================================================= */
+target_cuids AS (
+    SELECT
+        DISTINCT cuid
+    FROM calls
+),
+
+/* =========================================================
+   CLX + CCX
+   ========================================================= */
+appl_base AS (
+    SELECT
+        a.cuid,
+        a.contract_code,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user,
+        a.name_credit_status,
+        'CLX' AS appl_source
+
+    FROM ap_tls.tb_tls_appl_clx a
+
+    JOIN target_cuids c
+        ON c.cuid = a.cuid
+
+    WHERE a.contract_code IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        a.cuid,
+        a.contract_code,
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user,
+        a.name_credit_status,
+        'CCX' AS appl_source
+
+    FROM ap_tls.tb_tls_appl_ccx a
+
+    JOIN target_cuids c
+        ON c.cuid = a.cuid
+
+    WHERE a.contract_code IS NOT NULL
+),
+
+/* =========================================================
+   Application relate Ops
+   ========================================================= */
+contract_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.time_of_call_start_t,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date,
+        a.preprocess_user,
+        a.process_date,
+        a.process_user
+
+    FROM calls s
+
+    JOIN appl_base a
+        ON a.cuid = s.cuid
+--       AND (
+--            a.preprocess_user = s.username
+--            OR a.process_user = s.username
+--       )
+),
+
+/* =========================================================
+   STEP 2 - BOD
+   ========================================================= */
+bod AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.team,
+
+        s.call_uuid_t,
+        s.time_of_call_start_t,
+        s.call_type_t,
+        s.record_type_t,
+
+        s.call_uuid_t0,
+        s.time_of_call_start_t0,
+
+        s.result_step_1,
+
+        a.contract_code,
+        a.appl_source,
+
+        a.preprocess_date AS bod1_date,
+        a.process_date AS bod2_date,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+                THEN a.preprocess_user
+        END AS bod1_username,
+
+        CASE
+            WHEN a.process_user = s.username
+                THEN a.process_user
+        END AS bod2_username,
+
+        CASE
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date >= s.time_of_call_start_t - 30
+             AND a.preprocess_date < s.time_of_call_start_t
+                THEN 1
+            ELSE 0
+        END AS bod1_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date >= s.time_of_call_start_t - 180
+             AND a.process_date < s.time_of_call_start_t
+                THEN 1
+            ELSE 0
+        END AS bod2_result,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+                THEN 'BOD2'
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+                THEN 'BOD1'
+        END AS stage,
+
+        CASE
+            WHEN a.process_user = s.username
+             AND a.process_date IS NOT NULL
+                THEN a.process_date
+
+            WHEN a.preprocess_user = s.username
+             AND a.preprocess_date IS NOT NULL
+                THEN a.preprocess_date
+        END AS bod_date
+
+    FROM calls s
+
+    LEFT JOIN contract_candidates a
+        ON a.cuid = s.cuid
+       AND a.username = s.username
+),
+
+step2 AS (
+    SELECT
+        b.*,
+
+        CASE
+            WHEN b.bod1_result = 1
+              OR b.bod2_result = 1
+                THEN 1
+            ELSE 0
+        END AS result_step_2
+
+    FROM bod b
+),
+
+/* =========================================================
+   Next application
+   ========================================================= */
+next_candidates AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code AS current_contract_code,
+        s.bod1_date,
+
+        a.contract_code AS next_apply_contract_code,
+        a.preprocess_date AS next_apply_date,
+        a.name_credit_status,
+        a.appl_source AS source_code
+
+    FROM step2 s
+
+    JOIN appl_base a
+        ON a.cuid = s.cuid
+--       AND a.preprocess_user = s.username
+       AND a.contract_code <> s.contract_code
+       AND a.preprocess_date > s.bod1_date
+       AND a.preprocess_date <= SYSDATE
+
+    WHERE s.bod1_date IS NOT NULL
+),
+
+next_ranked AS (
+    SELECT
+        n.*,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                n.cuid,
+                n.username,
+                n.current_contract_code,
+                n.bod1_date
+
+            ORDER BY
+                n.next_apply_date,
+                n.next_apply_contract_code,
+                n.source_code
+        ) AS rn
+
+    FROM next_candidates n
+),
+
+/* =========================================================
+   PREV_CONTRACT
+   ========================================================= */
+
+prev_contract AS (
+    SELECT
+        s.cuid,
+        s.username,
+        s.contract_code,
+        s.bod1_date,
+
+        h.contract_code AS prev_contract_code,
+        h.preprocess_date AS prev_bod1_date,
+        h.preprocess_user AS prev_bod1_username,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                s.cuid,
+                s.username,
+                s.contract_code,
+                s.bod1_date
+            ORDER BY
+                h.preprocess_date DESC,
+                h.contract_code DESC
+        ) AS rn
+
+    FROM step2 s
+
+    LEFT JOIN appl_base h
+      ON h.cuid = s.cuid
+     AND h.contract_code <> s.contract_code
+     AND h.preprocess_date < s.bod1_date
+),
+
+/* =========================================================
+   STEP 3
+   ========================================================= */
+step3 AS (
+    SELECT
+        s.*,
+
+        n.next_apply_contract_code,
+        n.next_apply_date,
+        n.name_credit_status,
+
+        p.prev_contract_code,
+        p.prev_bod1_date,
+        p.prev_bod1_username,
+
+        CASE
+            /* Current contract: BOD1  */
+            WHEN s.contract_code IS NULL
+              OR s.bod1_date IS NULL
+              OR s.bod1_username IS NULL
+              OR s.username IS NULL
+            THEN 0
+
+            /* BOD1 current contract <> current Ops */
+            WHEN s.bod1_username <> s.username
+            THEN 0
+
+            /* No previous contract */
+            WHEN p.prev_contract_code IS NULL
+            THEN 1
+
+            /* Previous contract same Ops */
+            WHEN p.prev_bod1_username = s.username
+            THEN 1
+
+            /* Previous contract <> Ops and <= 14 days */
+            WHEN s.bod1_date - p.prev_bod1_date <= 14
+            THEN 0
+
+            /* Previous contract <> Ops but > 14 days */
+            ELSE 1
+
+        END AS last_apply_14_days
+
+    FROM step2 s
+
+    LEFT JOIN next_ranked n
+      ON n.cuid = s.cuid
+     AND n.username = s.username
+     AND n.current_contract_code = s.contract_code
+     AND n.bod1_date = s.bod1_date
+     AND n.rn = 1
+
+    LEFT JOIN prev_contract p
+      ON p.cuid = s.cuid
+     AND p.username = s.username
+     AND p.contract_code = s.contract_code
+     AND p.bod1_date = s.bod1_date
+     AND p.rn = 1
+)
+
+/* =========================================================
+   HR mapping
+   ========================================================= */
+,hr AS (
+    SELECT
+        t.username AS op_username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM') AS month,
+        MAX(h.sup_name) AS sup_name
+
+    FROM t
+
+    JOIN ap_tls.hr_tls h
+        ON h.op_username = t.username
+       AND h.month =
+           TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    WHERE h.sup_name IS NOT NULL
+
+    GROUP BY
+        t.username,
+        TO_CHAR(t.time_of_call_start_t, 'YYYY-MM')
+
+    HAVING COUNT(DISTINCT h.sup_name) = 1
+)
+
+/* =========================================================
+   FINAL
+   ========================================================= */
+SELECT /*+ PARALLEL(16) */
+    r.cuid,
+    r.username,
+    r.team,
+    hr.sup_name,
+
+    r.call_uuid_t,
+    r.call_type_t,
+
+    r.time_of_call_start_t0,
+    r.time_of_call_start_t,
+
+    r.contract_code,
+    r.appl_source,
+
+    r.stage,
+    r.bod_date,
+
+    r.time_of_call_start_t
+        - r.bod_date AS follow_dates,
+
+    r.bod1_date,
+    r.bod1_username,
+
+    r.bod2_date,
+    r.bod2_username,
+
+    r.result_step_1,
+
+    r.bod1_result,
+    r.bod2_result,
+    r.result_step_2,
+
+    r.last_apply_14_days,
+
+    r.next_apply_contract_code,
+    r.next_apply_date,
+    r.name_credit_status,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+            THEN 1
+        ELSE 0
+    END AS result_step_3,
+
+    CASE
+        WHEN r.last_apply_14_days = 1
+         AND (
+                r.result_step_1 = 1
+                OR r.result_step_2 = 1
+             )
+            THEN 1
+        ELSE 0
+    END AS final_result
+
+FROM step3 r
+
+LEFT JOIN hr
+    ON hr.op_username = r.username
+   AND hr.month =
+       TO_CHAR(r.time_of_call_start_t, 'YYYY-MM')
+
+order by r.cuid desc, r.time_of_call_start_t desc   
+       ;
