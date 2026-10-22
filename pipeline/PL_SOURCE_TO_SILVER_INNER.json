@@ -226,7 +226,7 @@
 						{
 							"type": "Query",
 							"text": {
-								"value": "UPDATE ctrl.audit_log\nset status = 'FAILED',end_time = SYSUTCDATETIME()\nwhere adf_run_id = '@{pipeline().parameters.adf_run_id}' and table_id = @{item().table_id}",
+								"value": "UPDATE ctrl.audit_log\nset status = 'SUCCESS',end_time = SYSUTCDATETIME(),records_written = @{activity('Bronze to Silver').output.runOutput}\nwhere adf_run_id = '@{pipeline().parameters.adf_run_id}' and table_id = @{pipeline().parameters.table_id}",
 								"type": "Expression"
 							}
 						}
