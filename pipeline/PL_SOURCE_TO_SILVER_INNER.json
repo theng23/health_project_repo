@@ -249,10 +249,6 @@
 			"start_time": {
 				"type": "String",
 				"defaultValue": "1"
-			},
-			"adf_run_id": {
-				"type": "String",
-				"defaultValue": "a1"
 			}
 		},
 		"annotations": []
