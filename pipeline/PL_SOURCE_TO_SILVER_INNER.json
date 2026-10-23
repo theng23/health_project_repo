@@ -199,7 +199,7 @@
 				}
 			},
 			{
-				"name": "Update Failed Status",
+				"name": "Update Success Status",
 				"type": "Script",
 				"dependsOn": [
 					{
