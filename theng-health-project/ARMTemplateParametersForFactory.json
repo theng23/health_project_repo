@@ -1,0 +1,36 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+	"contentVersion": "1.0.0.0",
+	"parameters": {
+		"factoryName": {
+			"value": "theng-health-project"
+		},
+		"AzureDatabricks1_properties_typeProperties_existingClusterId": {
+			"value": "1011-131342-jlr8zekv"
+		},
+		"LS_ADLS_properties_typeProperties_url": {
+			"value": "https://healthyproject.dfs.core.windows.net/"
+		},
+		"LS_AzureKeyVault1_properties_typeProperties_baseUrl": {
+			"value": "https://key-thenghealth.vault.azure.net/"
+		},
+		"LS_AzureSqlDatabase1_properties_typeProperties_server": {
+			"value": "thenghealth-server.database.windows.net"
+		},
+		"LS_AzureSqlDatabase1_properties_typeProperties_database": {
+			"value": "sql-db-thenghealth"
+		},
+		"LS_AzureSqlDatabase1_properties_typeProperties_userName": {
+			"value": "thanhvo31226"
+		},
+		"LS_PostgreSql1_properties_typeProperties_server": {
+			"value": "ep-polished-darkness-b59drj9s-pooler.c-7.us-east-2.aws.neon.tech"
+		},
+		"LS_PostgreSql1_properties_typeProperties_database": {
+			"value": "neondb"
+		},
+		"LS_PostgreSql1_properties_typeProperties_username": {
+			"value": "neondb_owner"
+		}
+	}
+}
